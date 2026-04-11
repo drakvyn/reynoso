@@ -13,7 +13,8 @@ from dotenv import load_dotenv
 # ══════════════════════════════════════════════════════
 #  CONFIGURACIÓN  ← edita solo esta sección
 # ══════════════════════════════════════════════════════
-load_dotenv()
+# Junto a bot.py: systemd suele arrancar con cwd=/ y load_dotenv() no veía .env.
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 TOKEN           = os.getenv("DISCORD_TOKEN")
 ALLOWED_CHANNEL = int(os.getenv("ALLOWED_CHANNEL", "0"))
 INACTIVITY_TIMEOUT = 300  # segundos (5 min) sin reproducir → desconectar
