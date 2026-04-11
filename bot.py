@@ -72,21 +72,29 @@ COMMANDS_HELP = (
 # ─────────────────────────────────────────
 #  OPCIONES DE YT-DLP
 # ─────────────────────────────────────────
+# YouTube a veces no expone el mismo catálogo de formatos según el "cliente" que use yt-dlp.
+# android + web como fallback suele evitar "Requested format is not available" tras cambios del sitio.
+_YOUTUBE_EXTRACTOR_ARGS = {"youtube": {"player_client": ["android", "web"]}}
+# bestaudio → si no hay solo-audio, best → vídeo+audio; worst → último recurso si el resto falla.
+_YDL_AUDIO_FORMAT = "bestaudio/best/worst"
+
 YDL_FLAT = {
-    "format": "bestaudio/best",
+    "format": _YDL_AUDIO_FORMAT,
     "noplaylist": False,
     "quiet": True,
     "no_warnings": True,
     "extract_flat": "in_playlist",
     "default_search": "auto",
+    "extractor_args": _YOUTUBE_EXTRACTOR_ARGS,
 }
 
 YDL_FULL = {
-    "format": "bestaudio/best",
+    "format": _YDL_AUDIO_FORMAT,
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
     "extract_flat": False,
+    "extractor_args": _YOUTUBE_EXTRACTOR_ARGS,
 }
 
 FFMPEG_OPTIONS = {
