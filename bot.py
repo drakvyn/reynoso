@@ -13,11 +13,18 @@ from dotenv import load_dotenv
 # ══════════════════════════════════════════════════════
 #  CONFIGURACIÓN  ← edita solo esta sección
 # ══════════════════════════════════════════════════════
-# Junto a bot.py: systemd suele arrancar con cwd=/ y load_dotenv() no veía .env.
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 TOKEN           = os.getenv("DISCORD_TOKEN")
 ALLOWED_CHANNEL = int(os.getenv("ALLOWED_CHANNEL", "0"))
 INACTIVITY_TIMEOUT = 300  # segundos (5 min) sin reproducir → desconectar
+# Playlists: encolar de a N pistas y esperar entre tandas (menos presión a YouTube / Discord).
+PLAYLIST_BATCH_SIZE = 10
+PLAYLIST_BATCH_DELAY_SEC = 2.0
+# Si está activo (por defecto sí): al no estar el bot en un canal de voz conectado se vacía la cola y no se encadena
+# más reproducción (evita errores al llamar play sin voice). En .env: HALT_PLAYBACK_WHEN_NOT_IN_VOICE=0 para desactivar.
+_raw_halt = os.getenv("HALT_PLAYBACK_WHEN_NOT_IN_VOICE", "1").strip().lower()
+HALT_PLAYBACK_WHEN_NOT_IN_VOICE = _raw_halt not in ("0", "false", "no", "off")
+# YouTube: cookies Netscape casi obligatorias — en .env: YOUTUBE_COOKIES=cookies-youtube-com.txt (junto a bot.py o ruta absoluta).
 # ══════════════════════════════════════════════════════
 
 # ─────────────────────────────────────────
@@ -55,7 +62,7 @@ COMMANDS_HELP = (
     "```\n"
     "📋 Comandos disponibles (prefijo: p )\n"
     "──────────────────────────────────────\n"
-    "p +<url>          → Reproduce un video o playlist de YouTube\n"
+    "p +<url>          → Reproduce un video o playlist (playlist: de a 10 pistas + pausa)\n"
     "p next <url>      → Reproduce esta canción después de la actual\n"
     "p skip            → Salta la canción actual\n"
     "p pause           → Pausa la reproducción\n"
@@ -76,8 +83,8 @@ COMMANDS_HELP = (
 # YouTube a veces no expone el mismo catálogo de formatos según el "cliente" que use yt-dlp.
 # android + web como fallback suele evitar "Requested format is not available" tras cambios del sitio.
 _YOUTUBE_EXTRACTOR_ARGS = {"youtube": {"player_client": ["android", "web"]}}
-# bestaudio → si no hay solo-audio, best → vídeo+audio; worst → último recurso si el resto falla.
-_YDL_AUDIO_FORMAT = "bestaudio/best/worst"
+# Prioriza webm (opus, p. ej. 251): buena calidad y liviano para Discord; luego bestaudio/best por si no hay webm.
+_YDL_AUDIO_FORMAT = "bestaudio[ext=webm]/bestaudio/best"
 
 YDL_FLAT = {
     "format": _YDL_AUDIO_FORMAT,
@@ -96,7 +103,32 @@ YDL_FULL = {
     "no_warnings": True,
     "extract_flat": False,
     "extractor_args": _YOUTUBE_EXTRACTOR_ARGS,
+    "nocheckcertificate": True,
+    "ignoreerrors": True,
 }
+
+
+def _youtube_cookiefile() -> str | None:
+    raw = os.getenv("YOUTUBE_COOKIES", "").strip()
+    if not raw:
+        return None
+    path = raw if os.path.isabs(raw) else os.path.join(os.path.dirname(os.path.abspath(__file__)), raw)
+    if os.path.isfile(path):
+        return path
+    log.warning("YOUTUBE_COOKIES=%s → no es un archivo válido; yt-dlp irá sin cookies", raw)
+    return None
+
+
+_yt_cookie = _youtube_cookiefile()
+if _yt_cookie:
+    YDL_FLAT["cookiefile"] = _yt_cookie
+    YDL_FULL["cookiefile"] = _yt_cookie
+    log.info("yt-dlp usará cookies de YouTube: %s", _yt_cookie)
+else:
+    log.warning(
+        "Sin YOUTUBE_COOKIES válido: definí el archivo en .env (mismo dir que bot.py). "
+        "YouTube suele fallar sin cookies."
+    )
 
 FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
@@ -121,6 +153,72 @@ def get_state(guild_id: int) -> GuildState:
     if guild_id not in guild_states:
         guild_states[guild_id] = GuildState()
     return guild_states[guild_id]
+
+
+def _bot_voice_connected(guild_id: int) -> bool:
+    """True si el bot sigue en un canal de voz conectado en ese guild."""
+    guild = bot.get_guild(guild_id)
+    if not guild or not guild.voice_client:
+        return False
+    return guild.voice_client.is_connected()
+
+
+async def enqueue_playlist_tail(guild_id: int, state: GuildState, tracks: list[dict]) -> None:
+    """Agrega una playlist al final de la cola, de a PLAYLIST_BATCH_SIZE con pausa entre tandas."""
+    n = len(tracks)
+    for i in range(0, n, PLAYLIST_BATCH_SIZE):
+        if HALT_PLAYBACK_WHEN_NOT_IN_VOICE and not _bot_voice_connected(guild_id):
+            log.info("Encolado en segundo plano detenido: sin voz (guild %s)", guild_id)
+            return
+        state.queue.extend(tracks[i : i + PLAYLIST_BATCH_SIZE])
+        if i + PLAYLIST_BATCH_SIZE < n:
+            await asyncio.sleep(PLAYLIST_BATCH_DELAY_SEC)
+
+
+def apply_playlist_front_first_batch(state: GuildState, tracks: list[dict]) -> tuple[list[dict], int]:
+    """Primera tanda al frente (appendleft). Devuelve (resto, índice tras el bloque insertado)."""
+    batch = tracks[:PLAYLIST_BATCH_SIZE]
+    for t in reversed(batch):
+        state.queue.appendleft(t)
+    return tracks[PLAYLIST_BATCH_SIZE:], len(batch)
+
+
+async def enqueue_playlist_front_rest(
+    guild_id: int, state: GuildState, tracks: list[dict], insert_after: int
+) -> None:
+    """Tandas siguientes al frente, con insert; `insert_after` = posición tras el bloque ya colocado."""
+    n = len(tracks)
+    pos = insert_after
+    for i in range(0, n, PLAYLIST_BATCH_SIZE):
+        if HALT_PLAYBACK_WHEN_NOT_IN_VOICE and not _bot_voice_connected(guild_id):
+            log.info("Inserción en segundo plano detenida: sin voz (guild %s)", guild_id)
+            return
+        chunk = tracks[i : i + PLAYLIST_BATCH_SIZE]
+        for j, t in enumerate(chunk):
+            state.queue.insert(pos + j, t)
+        pos += len(chunk)
+        if i + PLAYLIST_BATCH_SIZE < n:
+            await asyncio.sleep(PLAYLIST_BATCH_DELAY_SEC)
+
+
+def _schedule_tail_batches(guild_id: int, state: GuildState, rest: list[dict]) -> None:
+    async def _job():
+        try:
+            await enqueue_playlist_tail(guild_id, state, rest)
+        except Exception:
+            log.exception("Error al encolar tandas restantes (final de cola)")
+
+    asyncio.create_task(_job())
+
+
+def _schedule_front_batches(guild_id: int, state: GuildState, rest: list[dict], insert_after: int) -> None:
+    async def _job():
+        try:
+            await enqueue_playlist_front_rest(guild_id, state, rest, insert_after)
+        except Exception:
+            log.exception("Error al insertar tandas restantes (frente de cola)")
+
+    asyncio.create_task(_job())
 
 
 # ─────────────────────────────────────────
@@ -150,6 +248,23 @@ async def ensure_voice(ctx: commands.Context) -> discord.VoiceClient | None:
     if vc.channel != channel:
         await vc.move_to(channel)
     return vc
+
+
+async def _halt_playback_when_no_voice(guild_id: int) -> None:
+    """Vacía cola y estado de reproducción cuando no hay conexión de voz (idempotente)."""
+    state = get_state(guild_id)
+    _cancel_inactivity(state)
+    guild = bot.get_guild(guild_id)
+    vc = guild.voice_client if guild else None
+    if vc:
+        try:
+            vc.stop()
+        except Exception:
+            pass
+    state.queue.clear()
+    state.now_playing = None
+    state.loop = False
+    log.info("Reproducción detenida: bot sin canal de voz (guild %s)", guild_id)
 
 
 # ─────────────────────────────────────────
@@ -344,6 +459,15 @@ async def get_stream_url(track: dict) -> tuple[str, str]:
 
 async def play_next(guild_id: int, voice_client: discord.VoiceClient, channel: discord.TextChannel):
     """Reproduce la siguiente pista de la cola."""
+    guild = bot.get_guild(guild_id)
+    voice_client = guild.voice_client if guild else None
+
+    if HALT_PLAYBACK_WHEN_NOT_IN_VOICE and (
+        voice_client is None or not voice_client.is_connected()
+    ):
+        await _halt_playback_when_no_voice(guild_id)
+        return
+
     state = get_state(guild_id)
 
     async with state._lock:
@@ -372,9 +496,14 @@ async def play_next(guild_id: int, voice_client: discord.VoiceClient, channel: d
                 log.error("Error en reproducción: %s", error)
             if state.loop:
                 state.queue.appendleft(track)
-            asyncio.run_coroutine_threadsafe(
-                play_next(guild_id, voice_client, channel), bot.loop
-            )
+
+            async def _chain():
+                if HALT_PLAYBACK_WHEN_NOT_IN_VOICE and not _bot_voice_connected(guild_id):
+                    await _halt_playback_when_no_voice(guild_id)
+                    return
+                await play_next(guild_id, voice_client, channel)
+
+            asyncio.run_coroutine_threadsafe(_chain(), bot.loop)
 
         voice_client.play(source, after=after_playing)
 
@@ -443,10 +572,19 @@ async def play(ctx: commands.Context, *, url: str):
         else:
             await ctx.send(f"➕ **Agregado a la cola:** `{tracks[0]['title']}`")
     else:
-        state.queue.extend(tracks)
-        await ctx.send(f"📋 **Playlist agregada:** `{len(tracks)}` pistas en la cola.")
+        total = len(tracks)
+        await ctx.send(
+            f"📋 **Playlist:** `{total}` pistas "
+            f"(entrando de a **{PLAYLIST_BATCH_SIZE}** con **{PLAYLIST_BATCH_DELAY_SEC:g}s** entre tandas)."
+        )
+        first_chunk = tracks[:PLAYLIST_BATCH_SIZE]
+        state.queue.extend(first_chunk)
         if not vc.is_playing():
             await play_next(guild_id, vc, ctx.channel)
+        rest = tracks[PLAYLIST_BATCH_SIZE:]
+        if rest:
+            _schedule_tail_batches(guild_id, state, rest)
+
 
 
 @bot.command(name="next")
@@ -467,8 +605,17 @@ async def play_next_cmd(ctx: commands.Context, *, url: str):
 
     state = get_state(guild_id)
 
-    for track in reversed(tracks):
-        state.queue.appendleft(track)
+    if len(tracks) == 1:
+        state.queue.appendleft(tracks[0])
+    else:
+        await ctx.send(
+            f"⏩ **Insertando `{len(tracks)}` pistas al frente** "
+            f"(de a **{PLAYLIST_BATCH_SIZE}**, **{PLAYLIST_BATCH_DELAY_SEC:g}s** entre tandas). "
+            f"*(El resto de la cola queda después de la playlist)*"
+        )
+        rest_front, insert_after = apply_playlist_front_first_batch(state, tracks)
+        if rest_front:
+            _schedule_front_batches(guild_id, state, rest_front, insert_after)
 
     if not vc.is_playing():
         await play_next(guild_id, vc, ctx.channel)
@@ -480,9 +627,10 @@ async def play_next_cmd(ctx: commands.Context, *, url: str):
             )
         else:
             await ctx.send(
-                f"⏩ **{len(tracks)} pistas insertadas al frente de la cola.**\n"
-                f"*(Continúa la playlist después)*"
+                "⏩ **Listo:** playlist al frente de la cola.\n"
+                "*(Continúa el resto después)*"
             )
+
 
 
 @bot.command(name="skip")
@@ -618,6 +766,17 @@ async def help_cmd(ctx: commands.Context):
 # ─────────────────────────────────────────
 #  EVENTOS
 # ─────────────────────────────────────────
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    if member.id != bot.user.id:
+        return
+    if not HALT_PLAYBACK_WHEN_NOT_IN_VOICE:
+        return
+    # El bot salió del canal de voz (desconexión o expulsión), no un simple traslado entre canales.
+    if before.channel is not None and after.channel is None:
+        await _halt_playback_when_no_voice(member.guild.id)
+
+
 @bot.event
 async def on_ready():
     global http_session
